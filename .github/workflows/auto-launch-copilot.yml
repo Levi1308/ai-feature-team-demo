@@ -1,0 +1,217 @@
+name: Auto-Launch Copilot Agent
+
+# Triggers when an issue is opened or a label is added.
+# Only proceeds if the issue has the label: agent:auto
+# Never merges. Never deploys.
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  issues: write      # post comments
+  contents: read     # read repo metadata
+
+jobs:
+  launch:
+    name: Launch Copilot on Issue #${{ github.event.issue.number }}
+    runs-on: ubuntu-latest
+
+    # Guard: only run if the issue has the agent:auto label
+    if: |
+      contains(
+        toJSON(github.event.issue.labels.*.name),
+        'agent:auto'
+      )
+
+    steps:
+      # ── 1. Diagnose token ────────────────────────────────────────────────────
+      - name: Verify PAT and diagnose token type
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "❌ COPILOT_ASSIGN_PAT is not set."
+            echo "Create a classic PAT with repo scope: https://github.com/settings/tokens"
+            exit 1
+          fi
+
+          PREFIX=$(echo "$PAT" | cut -c1-4)
+          echo "Token prefix: $PREFIX"
+          if [ "$PREFIX" = "ghp_" ]; then
+            echo "✅ Classic PAT (ghp_) — recommended for Copilot assignment"
+          elif [ "$PREFIX" = "gith" ]; then
+            echo "⚠️  Fine-grained PAT — may fail if permissions are insufficient"
+          elif [ "$PREFIX" = "ghs_" ]; then
+            echo "❌ GITHUB_TOKEN will not work for Copilot assignment"
+            exit 1
+          fi
+
+          HTTP=$(curl -s -o /tmp/user.json -w "%{http_code}" \
+            -H "Authorization: Bearer $PAT" \
+            https://api.github.com/user)
+          if [ "$HTTP" = "200" ]; then
+            LOGIN=$(python3 -c "import json; print(json.load(open('/tmp/user.json'))['login'])")
+            echo "✅ PAT valid — authenticated as: $LOGIN"
+          else
+            echo "❌ PAT invalid (HTTP $HTTP)"
+            exit 1
+          fi
+
+      # ── 2. Log issue context ─────────────────────────────────────────────────
+      - name: Log issue context
+        run: |
+          echo "Issue #:     ${{ github.event.issue.number }}"
+          echo "Title:       ${{ github.event.issue.title }}"
+          echo "State:       ${{ github.event.issue.state }}"
+          echo "Labels:      ${{ toJSON(github.event.issue.labels.*.name) }}"
+          echo "Event type:  ${{ github.event.action }}"
+
+      # ── 3. Assign issue to Copilot via REST agent_assignment ────────────────
+      - name: Assign issue to Copilot
+        id: assign
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          # Extract custom_instructions from issue body if present
+          # Looks for a section starting with "## Copilot Instructions" or uses a default
+          ISSUE_BODY=$(cat << 'BODY_EOF'
+          ${{ github.event.issue.body }}
+          BODY_EOF
+          )
+
+          PAYLOAD=$(python3 << 'PYEOF'
+          import json, re
+
+          body = """${{ github.event.issue.body }}"""
+          
+          # Try to extract custom instructions block from issue body
+          custom_instructions = ""
+          match = re.search(
+              r'(?:##\s*Copilot Instructions?|###\s*Agent Instructions?)(.*?)(?=\n##|\Z)',
+              body, re.DOTALL | re.IGNORECASE
+          )
+          if match:
+              custom_instructions = match.group(1).strip()
+
+          payload = {
+              "assignees": ["copilot-swe-agent[bot]"],
+              "agent_assignment": {
+                  "target_repo": "${{ github.repository }}",
+                  "base_branch": "main",
+                  "custom_instructions": custom_instructions,
+                  "custom_agent": ""
+              }
+          }
+          print(json.dumps(payload))
+          PYEOF
+          )
+
+          echo "Sending agent_assignment to REST API..."
+          HTTP=$(curl -s -o /tmp/assign_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/assignees")
+
+          echo "HTTP: $HTTP"
+          echo "assign_http=$HTTP" >> $GITHUB_OUTPUT
+
+          if [ "$HTTP" = "201" ]; then
+            ASSIGNEES=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/assign_response.json'))
+          print(', '.join(a['login'] for a in d.get('assignees', [])))
+            ")
+            echo "✅ Assigned. Assignees: $ASSIGNEES"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Assignment failed"
+            cat /tmp/assign_response.json
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4a. Post success comment ─────────────────────────────────────────────
+      - name: Post success comment
+        if: steps.assign.outputs.success == 'true'
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          BODY=$(python3 -c "
+          import json
+          body = '''## 🤖 Copilot Agent Launched
+
+          GitHub Copilot coding agent has been assigned to this issue and will begin working shortly.
+
+          **What happens next:**
+          1. Copilot will open a draft PR on a new branch
+          2. Base44 Feature Lead will automatically review the PR
+          3. The PR review will be posted as a comment here and on the PR
+          4. If the PR needs fixes, Copilot will be notified
+          5. When the PR is ready, Levi will be asked to review and merge
+
+          > ⚠️ **No merge will happen automatically.** Levi must approve and merge manually.
+
+          _Triggered by label: \`agent:auto\` on ${{ github.event.issue.updated_at }}_'''
+          print(json.dumps({'body': body}))
+          ")
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments"
+
+      # ── 4b. Post failure comment ─────────────────────────────────────────────
+      - name: Post failure comment
+        if: steps.assign.outputs.success == 'false'
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          RESPONSE=$(cat /tmp/assign_response.json 2>/dev/null || echo '{}')
+          BODY=$(python3 << PYEOF
+          import json
+          response = '''$RESPONSE'''
+          
+          http_code = "${{ steps.assign.outputs.assign_http }}"
+          
+          if http_code == "403":
+              reason = "PAT permission denied. The COPILOT_ASSIGN_PAT may be a fine-grained token with insufficient scope. Switch to a classic PAT with `repo` scope."
+          elif http_code == "422":
+              reason = "GitHub rejected the assignee. Copilot cloud agent may not be enabled on this repository. Check: Settings → Copilot → Coding agent."
+          elif http_code == "401":
+              reason = "PAT is expired or revoked. Regenerate and update the COPILOT_ASSIGN_PAT secret."
+          else:
+              reason = f"Unexpected HTTP {http_code}. Response: {response[:200]}"
+          
+          body = f"""## ❌ Copilot Agent Launch Failed
+
+          The automatic Copilot assignment failed for this issue.
+
+          **HTTP Status:** {http_code}
+          **Reason:** {reason}
+
+          **Manual fallback:**
+          1. Go to [Actions tab](../actions/workflows/launch-copilot-agent.yml)
+          2. Run the **Launch Copilot Agent** workflow manually with issue_number = ${{ github.event.issue.number }}
+
+          _Auto-triggered by label: \`agent:auto\`_"""
+          
+          print(json.dumps({"body": body}))
+          PYEOF
+          )
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments"
+
+          exit 1

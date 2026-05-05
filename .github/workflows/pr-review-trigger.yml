@@ -1,0 +1,169 @@
+name: PR Review Trigger
+
+# Triggers when a PR is opened, updated, reopened, or marked ready for review.
+# Adds label base44-review-needed so Base44 polling automation picks it up.
+# Posts a structured review-request comment.
+# Never merges. Never deploys. Never posts the actual review — Base44 does that.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  issues: write        # add labels + comments (also covers PR comments via issues API)
+  pull-requests: write # add labels to PRs
+  contents: read
+
+jobs:
+  trigger-review:
+    name: Request Base44 review for PR #${{ github.event.pull_request.number }}
+    runs-on: ubuntu-latest
+
+    # Skip draft PRs unless they are being marked ready_for_review
+    if: |
+      github.event.action == 'ready_for_review' ||
+      github.event.pull_request.draft == false
+
+    steps:
+      # ── 1. Collect PR context ────────────────────────────────────────────────
+      - name: Collect PR context
+        id: ctx
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          # Get PR details
+          PR=$(curl -s \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+
+          # Try to extract linked issue number from PR body (looks for #N or /issues/N)
+          LINKED_ISSUE=$(echo "$PR" | python3 -c "
+          import sys, json, re
+          pr = json.loads(sys.stdin.read())
+          body = pr.get('body', '') or ''
+          # Match 'closes #N', 'fixes #N', 'resolves #N', or plain '#N'
+          matches = re.findall(r'(?:closes?|fixes?|resolves?)\s+#(\d+)', body, re.IGNORECASE)
+          if not matches:
+              matches = re.findall(r'#(\d+)', body)
+          print(matches[0] if matches else '')
+          ")
+
+          echo "pr_number=$PR_NUMBER"              >> $GITHUB_OUTPUT
+          echo "repo=$REPO"                        >> $GITHUB_OUTPUT
+          echo "linked_issue=$LINKED_ISSUE"        >> $GITHUB_OUTPUT
+          echo "pr_title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "pr_author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+          echo "head_ref=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+          echo "event=${{ github.event.action }}"  >> $GITHUB_OUTPUT
+
+          echo "PR $PR_NUMBER: linked issue = ${LINKED_ISSUE:-none}"
+
+      # ── 2. Add label: base44-review-needed ──────────────────────────────────
+      - name: Add base44-review-needed label
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          # Ensure label exists first (idempotent)
+          curl -s -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"base44-review-needed","color":"0075ff","description":"Base44 Feature Lead review pending"}' \
+            "https://api.github.com/repos/${{ github.repository }}/labels" \
+            > /dev/null 2>&1 || true  # ignore 422 if label already exists
+
+          # Add label to PR
+          HTTP=$(curl -s -o /tmp/label_resp.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"labels":["base44-review-needed"]}' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels")
+
+          if [ "$HTTP" = "200" ]; then
+            echo "✅ Label base44-review-needed added to PR #${{ github.event.pull_request.number }}"
+          else
+            echo "⚠️  Label add returned HTTP $HTTP"
+            cat /tmp/label_resp.json
+          fi
+
+      # ── 3. Post structured review-request comment ────────────────────────────
+      - name: Post review-request comment
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          LINKED="${{ steps.ctx.outputs.linked_issue }}"
+          EVENT="${{ steps.ctx.outputs.event }}"
+          ISSUE_LINK=""
+          if [ -n "$LINKED" ]; then
+            ISSUE_LINK="https://github.com/${{ github.repository }}/issues/$LINKED"
+          fi
+
+          BODY=$(python3 << PYEOF
+          import json
+
+          linked_issue = "$LINKED"
+          event = "$EVENT"
+          issue_url = "$ISSUE_LINK"
+          pr_url = "${{ github.event.pull_request.html_url }}"
+          pr_number = "${{ github.event.pull_request.number }}"
+          repo = "${{ github.repository }}"
+
+          issue_section = f"- **Linked Issue:** #{linked_issue} — {issue_url}" if linked_issue else "- **Linked Issue:** _not detected — check PR body_"
+
+          event_desc = {
+              "opened": "PR opened",
+              "synchronize": "PR updated with new commits",
+              "reopened": "PR reopened",
+              "ready_for_review": "PR marked ready for review"
+          }.get(event, event)
+
+          body = f"""## 🔍 Base44 Review Requested
+
+          **Event:** {event_desc}
+          {issue_section}
+          - **PR:** #{pr_number} — {pr_url}
+          - **Repo:** {repo}
+
+          Base44 Feature Lead will review this PR automatically within ~10 minutes.
+
+          The review will check:
+          - Does the PR match the original issue requirements?
+          - Is the scope clean (no unrelated changes)?
+          - Are tests/evidence present?
+          - Are there security, data, or production risks?
+          - What is the recommended next action?
+
+          Review result will be posted as a comment on this PR.
+
+          > ⚠️ **No merge will happen automatically.** Levi must approve and merge manually.
+
+          _Label `base44-review-needed` has been added. Base44 polling will pick this up._"""
+
+          print(json.dumps({"body": body}))
+          PYEOF
+          )
+
+          HTTP=$(curl -s -o /tmp/comment_resp.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments")
+
+          if [ "$HTTP" = "201" ]; then
+            echo "✅ Review-request comment posted"
+          else
+            echo "⚠️  Comment returned HTTP $HTTP"
+            cat /tmp/comment_resp.json
+          fi
