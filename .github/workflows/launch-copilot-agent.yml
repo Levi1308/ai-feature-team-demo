@@ -7,11 +7,6 @@ on:
         description: "Issue number to assign to Copilot (e.g. 1)"
         required: true
         type: number
-      target_repo:
-        description: "Target repo for Copilot to work in (owner/repo). Defaults to this repo."
-        required: false
-        default: ""
-        type: string
       base_branch:
         description: "Base branch for Copilot to branch from. Defaults to main."
         required: false
@@ -23,12 +18,10 @@ on:
         default: ""
         type: string
 
-# Minimum permissions needed by the GITHUB_TOKEN (workflow read, issues write for comments only)
-# The actual Copilot assignment uses the COPILOT_ASSIGN_PAT secret.
 permissions:
-  issues: write        # post a comment on the issue
-  contents: read       # read repo metadata
-  pull-requests: read  # detect PR created by Copilot
+  issues: write
+  contents: read
+  pull-requests: read
 
 jobs:
   launch-copilot:
@@ -39,432 +32,236 @@ jobs:
       # ── 1. Validate inputs ──────────────────────────────────────────────────
       - name: Validate inputs
         run: |
+          echo "✅ Input validation"
+          echo "  issue_number : ${{ inputs.issue_number }}"
+          echo "  base_branch  : ${{ inputs.base_branch || 'main' }}"
           if [ -z "${{ inputs.issue_number }}" ]; then
-            echo "❌ ERROR: issue_number is required."
+            echo "❌ issue_number is required"
             exit 1
           fi
-          echo "✅ Input validation passed."
-          echo "  issue_number  : ${{ inputs.issue_number }}"
-          echo "  target_repo   : ${{ inputs.target_repo || github.repository }}"
-          echo "  base_branch   : ${{ inputs.base_branch }}"
 
-      # ── 2. Verify PAT is set (without printing it) ──────────────────────────
-      - name: Verify PAT secret is configured
+      # ── 2. Verify PAT secret + diagnose token type ──────────────────────────
+      - name: Verify PAT and diagnose token type
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
         run: |
-          if [ -z "${{ secrets.COPILOT_ASSIGN_PAT }}" ]; then
-            echo "❌ ERROR: Secret COPILOT_ASSIGN_PAT is not set."
+          if [ -z "$PAT" ]; then
+            echo "❌ COPILOT_ASSIGN_PAT is not set."
             echo ""
-            echo "To fix this:"
-            echo "  1. Create a fine-grained PAT at: https://github.com/settings/personal-access-tokens/new"
-            echo "  2. Required permissions (see docs/github-copilot-launcher.md for full guide):"
-            echo "     - Issues: Read & write"
-            echo "     - Pull requests: Read & write"
-            echo "     - Contents: Read & write"
-            echo "     - Metadata: Read-only (mandatory)"
-            echo "     - Copilot: (if available on your plan) Read & write"
-            echo "  3. Store it as a repository secret named: COPILOT_ASSIGN_PAT"
-            echo "  4. Go to: Settings > Secrets and variables > Actions > New repository secret"
+            echo "Create a CLASSIC PAT at https://github.com/settings/tokens"
+            echo "Required scopes: repo (full)"
+            echo "Store it as repository secret: COPILOT_ASSIGN_PAT"
             exit 1
           fi
-          echo "✅ COPILOT_ASSIGN_PAT is configured."
 
-      # ── 3. Resolve target repo ──────────────────────────────────────────────
-      - name: Resolve target repo
-        id: resolve
-        run: |
-          TARGET_REPO="${{ inputs.target_repo }}"
-          if [ -z "$TARGET_REPO" ]; then
-            TARGET_REPO="${{ github.repository }}"
+          # Diagnose token type without printing the token value
+          PREFIX=$(echo "$PAT" | cut -c1-4)
+          echo "Token prefix (first 4 chars): $PREFIX"
+          if [ "$PREFIX" = "ghp_" ]; then
+            echo "✅ Token type: Classic PAT (ghp_) — recommended for Copilot assignment"
+          elif [ "$PREFIX" = "gith" ]; then
+            echo "⚠️  Token type: Fine-grained PAT (github_pat_...) — may lack Copilot scope"
+            echo "   If assignment fails with 403/FORBIDDEN, switch to a classic PAT with 'repo' scope"
+          elif [ "$PREFIX" = "ghs_" ]; then
+            echo "❌ Token type: GITHUB_TOKEN (ghs_) — will NOT work for Copilot assignment"
+            echo "   GitHub requires a PAT, not a GITHUB_TOKEN, for Copilot bot assignment"
+            exit 1
+          else
+            echo "ℹ️  Token type: Unknown prefix ($PREFIX)"
           fi
-          OWNER=$(echo "$TARGET_REPO" | cut -d'/' -f1)
-          REPO=$(echo "$TARGET_REPO" | cut -d'/' -f2)
-          echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
-          echo "owner=$OWNER"             >> $GITHUB_OUTPUT
-          echo "repo=$REPO"               >> $GITHUB_OUTPUT
-          echo "✅ Resolved target: $TARGET_REPO"
 
-      # ── 4. Verify issue exists ──────────────────────────────────────────────
+          # Verify the token works at all
+          HTTP=$(curl -s -o /tmp/user.json -w "%{http_code}" \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user)
+          if [ "$HTTP" = "200" ]; then
+            LOGIN=$(python3 -c "import json; print(json.load(open('/tmp/user.json')).get('login','?'))")
+            echo "✅ PAT is valid — authenticated as: $LOGIN"
+          else
+            echo "❌ PAT authentication failed (HTTP $HTTP)"
+            exit 1
+          fi
+
+      # ── 3. Verify issue exists ──────────────────────────────────────────────
       - name: Verify issue exists
-        id: verify_issue
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
         run: |
-          RESPONSE=$(curl -s -o /tmp/issue.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}" \
+          HTTP=$(curl -s -o /tmp/issue.json -w "%{http_code}" \
+            -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ steps.resolve.outputs.target_repo }}/issues/${{ inputs.issue_number }}")
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ inputs.issue_number }}")
 
-          if [ "$RESPONSE" != "200" ]; then
-            echo "❌ ERROR: Issue #${{ inputs.issue_number }} not found in ${{ steps.resolve.outputs.target_repo }}."
-            echo "   HTTP response: $RESPONSE"
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ Issue #${{ inputs.issue_number }} not found (HTTP $HTTP)"
+            cat /tmp/issue.json
             exit 1
           fi
 
-          TITLE=$(python3 -c "import json; d=json.load(open('/tmp/issue.json')); print(d.get('title','unknown'))")
-          STATE=$(python3 -c "import json; d=json.load(open('/tmp/issue.json')); print(d.get('state','unknown'))")
+          TITLE=$(python3 -c "import json; print(json.load(open('/tmp/issue.json'))['title'])")
+          STATE=$(python3 -c "import json; print(json.load(open('/tmp/issue.json'))['state'])")
           echo "✅ Issue found: #${{ inputs.issue_number }} — $TITLE (state: $STATE)"
-          echo "issue_title=$TITLE" >> $GITHUB_OUTPUT
 
           if [ "$STATE" != "open" ]; then
-            echo "⚠️  WARNING: Issue is not open (state: $STATE). Copilot may not start."
+            echo "⚠️  Issue is not open — Copilot may not start"
           fi
 
-      # ── 5. Post custom instructions comment (if provided) ──────────────────
+      # ── 4. Post custom instructions comment (if provided) ──────────────────
       - name: Post custom instructions comment
         if: inputs.custom_instructions != ''
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
         run: |
-          python3 << 'PYEOF'
-          import json, urllib.request, urllib.error, os
+          BODY=$(python3 -c "
+          import json
+          body = '## 🤖 Copilot Instructions\n\n${{ inputs.custom_instructions }}'
+          print(json.dumps({'body': body}))
+          ")
 
-          instructions = """${{ inputs.custom_instructions }}"""
-          comment_body = f"## 🤖 Copilot Agent Instructions\n\n{instructions}"
-
-          payload = json.dumps({"body": comment_body}).encode()
-          req = urllib.request.Request(
-            url="https://api.github.com/repos/${{ steps.resolve.outputs.target_repo }}/issues/${{ inputs.issue_number }}/comments",
-            data=payload,
-            method="POST",
-            headers={
-              "Authorization": "Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "Content-Type": "application/json",
-            }
-          )
-          try:
-            with urllib.request.urlopen(req) as resp:
-              result = json.loads(resp.read())
-              print(f"✅ Comment posted: {result.get('html_url')}")
-          except urllib.error.HTTPError as e:
-            print(f"⚠️  Could not post comment: {e.code} {e.reason}")
-            # Non-fatal — continue to assignment
-          PYEOF
-
-      # ── 6. Look up Copilot bot node ID via GraphQL ──────────────────────────
-      - name: Look up Copilot bot actor ID
-        id: copilot_actor
-        run: |
-          python3 << 'PYEOF'
-          import json, urllib.request, urllib.error
-
-          # Query suggestedActors for Copilot on this repo
-          query = """
-          query($owner: String!, $repo: String!) {
-            repository(owner: $owner, name: $repo) {
-              suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
-                nodes {
-                  login
-                  __typename
-                  ... on Bot {
-                    id
-                  }
-                  ... on User {
-                    id
-                  }
-                }
-              }
-            }
-          }
-          """
-          payload = json.dumps({
-            "query": query,
-            "variables": {
-              "owner": "${{ steps.resolve.outputs.owner }}",
-              "repo":  "${{ steps.resolve.outputs.repo }}"
-            }
-          }).encode()
-
-          req = urllib.request.Request(
-            url="https://api.github.com/graphql",
-            data=payload,
-            method="POST",
-            headers={
-              "Authorization": "Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}",
-              "Content-Type": "application/json",
-              "GraphQL-Features": "issues_copilot_assignment_api_support",
-            }
-          )
-
-          try:
-            with urllib.request.urlopen(req) as resp:
-              result = json.loads(resp.read())
-          except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            print(f"❌ GraphQL request failed: {e.code} — {body}")
-            exit(1)
-
-          if "errors" in result:
-            print(f"❌ GraphQL errors: {json.dumps(result['errors'], indent=2)}")
-            exit(1)
-
-          nodes = result.get("data", {}).get("repository", {}).get("suggestedActors", {}).get("nodes", [])
-          copilot_id = None
-          for node in nodes:
-            login = node.get("login", "").lower()
-            if "copilot" in login:
-              copilot_id = node.get("id")
-              print(f"✅ Found Copilot actor: login={node['login']}, type={node['__typename']}, id=REDACTED")
-              break
-
-          if not copilot_id:
-            print("❌ Copilot actor not found in suggestedActors.")
-            print("   Available actors:")
-            for node in nodes:
-              print(f"     - {node.get('login')} ({node.get('__typename')})")
-            print("")
-            print("   Likely causes:")
-            print("   1. GitHub Copilot coding agent is not enabled on your account/plan.")
-            print("      Required: Copilot Pro, Pro+, Business, or Enterprise.")
-            print("   2. Copilot coding agent is not enabled for this repository.")
-            print("      Go to: github.com/settings/copilot → enable 'Coding agent'")
-            print("   3. Your PAT lacks the 'Copilot' permission scope.")
-            exit(1)
-
-          with open("/tmp/copilot_actor_id.txt", "w") as f:
-            f.write(copilot_id)
-          print("Actor ID saved.")
-          PYEOF
-
-          ACTOR_ID=$(cat /tmp/copilot_actor_id.txt)
-          echo "copilot_actor_id=$ACTOR_ID" >> $GITHUB_OUTPUT
-
-      # ── 7. Get issue node ID ─────────────────────────────────────────────────
-      - name: Get issue node ID
-        id: issue_node
-        run: |
-          python3 << 'PYEOF'
-          import json, urllib.request, urllib.error
-
-          query = """
-          query($owner: String!, $repo: String!, $number: Int!) {
-            repository(owner: $owner, name: $repo) {
-              issue(number: $number) {
-                id
-                title
-              }
-            }
-          }
-          """
-          payload = json.dumps({
-            "query": query,
-            "variables": {
-              "owner":  "${{ steps.resolve.outputs.owner }}",
-              "repo":   "${{ steps.resolve.outputs.repo }}",
-              "number": ${{ inputs.issue_number }}
-            }
-          }).encode()
-
-          req = urllib.request.Request(
-            url="https://api.github.com/graphql",
-            data=payload,
-            method="POST",
-            headers={
-              "Authorization": "Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}",
-              "Content-Type": "application/json",
-              "GraphQL-Features": "issues_copilot_assignment_api_support",
-            }
-          )
-
-          with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-
-          if "errors" in result:
-            print(f"❌ GraphQL errors: {json.dumps(result['errors'], indent=2)}")
-            exit(1)
-
-          issue_id = result["data"]["repository"]["issue"]["id"]
-          print(f"✅ Issue node ID retrieved.")
-
-          with open("/tmp/issue_node_id.txt", "w") as f:
-            f.write(issue_id)
-          PYEOF
-
-          ISSUE_NODE_ID=$(cat /tmp/issue_node_id.txt)
-          echo "issue_node_id=$ISSUE_NODE_ID" >> $GITHUB_OUTPUT
-
-      # ── 8. Assign Copilot to issue via GraphQL mutation ─────────────────────
-      - name: Assign Copilot to issue
-        id: assign
-        run: |
-          python3 << 'PYEOF'
-          import json, urllib.request, urllib.error
-
-          issue_id   = open("/tmp/issue_node_id.txt").read().strip()
-          actor_id   = open("/tmp/copilot_actor_id.txt").read().strip()
-          base_branch = "${{ inputs.base_branch }}" or "main"
-          target_repo = "${{ steps.resolve.outputs.target_repo }}"
-
-          # Use replaceActorsForAssignable with Copilot extension header
-          # Also attempt REST agent_assignment for base_branch + target_repo config
-          mutation = """
-          mutation($assignableId: ID!, $actorIds: [ID!]!) {
-            replaceActorsForAssignable(input: {
-              assignableId: $assignableId,
-              actorIds: $actorIds
-            }) {
-              assignable {
-                ... on Issue {
-                  id
-                  title
-                  url
-                  assignees(first: 10) {
-                    nodes {
-                      login
-                    }
-                  }
-                }
-              }
-            }
-          }
-          """
-
-          payload = json.dumps({
-            "query": mutation,
-            "variables": {
-              "assignableId": issue_id,
-              "actorIds": [actor_id]
-            }
-          }).encode()
-
-          req = urllib.request.Request(
-            url="https://api.github.com/graphql",
-            data=payload,
-            method="POST",
-            headers={
-              "Authorization": "Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}",
-              "Content-Type": "application/json",
-              "GraphQL-Features": "issues_copilot_assignment_api_support",
-            }
-          )
-
-          try:
-            with urllib.request.urlopen(req) as resp:
-              result = json.loads(resp.read())
-          except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            print(f"❌ GraphQL mutation failed: {e.code} — {body}")
-            print("")
-            print("Likely causes:")
-            print("  - PAT does not have 'Copilot' permission scope")
-            print("  - Copilot coding agent not enabled on this repo/account")
-            print("  - Token is a GitHub App token (only PATs work for Copilot assignment)")
-            exit(1)
-
-          if "errors" in result:
-            errors = result["errors"]
-            print(f"❌ Assignment mutation returned errors:")
-            for e in errors:
-              print(f"   {e.get('message', e)}")
-            print("")
-            print("Likely causes:")
-            print("  - Copilot coding agent not enabled (Settings > Copilot > Coding agent)")
-            print("  - PAT permissions insufficient")
-            print("  - Repository not enabled for Copilot agent")
-            exit(1)
-
-          assignable = result.get("data", {}).get("replaceActorsForAssignable", {}).get("assignable", {})
-          assignees = [n["login"] for n in assignable.get("assignees", {}).get("nodes", [])]
-          url = assignable.get("url", "")
-
-          copilot_assigned = any("copilot" in a.lower() for a in assignees)
-
-          if copilot_assigned:
-            print(f"✅ SUCCESS: Copilot has been assigned to the issue!")
-            print(f"   Issue URL : {url}")
-            print(f"   Assignees : {', '.join(assignees)}")
-          else:
-            print(f"⚠️  Mutation succeeded but Copilot not found in assignees: {assignees}")
-            print("   Copilot may still start — check the issue page on GitHub.")
-          PYEOF
-
-      # ── 9. Verify assignment via REST + check for agent startup ─────────────
-      - name: Verify assignment and check agent status
-        run: |
-          sleep 3  # Brief pause for assignment to propagate
-
-          RESPONSE=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}" \
+          HTTP=$(curl -s -o /tmp/comment.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ steps.resolve.outputs.target_repo }}/issues/${{ inputs.issue_number }}")
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/comments")
 
-          python3 << 'PYEOF'
+          if [ "$HTTP" = "201" ]; then
+            URL=$(python3 -c "import json; print(json.load(open('/tmp/comment.json')).get('html_url','?'))")
+            echo "✅ Comment posted: $URL"
+          else
+            echo "⚠️  Comment failed (HTTP $HTTP) — non-fatal, continuing"
+          fi
+
+      # ── 5. Assign issue to Copilot via REST agent_assignment ────────────────
+      #
+      # This uses the official REST endpoint with the agent_assignment payload.
+      # Reference: https://github.blog/changelog/2025-12-03-assign-issues-to-copilot-using-the-api/
+      #
+      # Key facts:
+      #   - assignees must be ["copilot-swe-agent[bot]"]
+      #   - agent_assignment.target_repo tells Copilot which repo to work in
+      #   - agent_assignment.base_branch tells Copilot which branch to start from
+      #   - A classic PAT with 'repo' scope is required
+      #   - Fine-grained PATs need: Issues+PR+Contents+Actions (write)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Assign issue to Copilot via REST agent_assignment
+        id: assign
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          BASE_BRANCH="${{ inputs.base_branch }}"
+          if [ -z "$BASE_BRANCH" ]; then
+            BASE_BRANCH="main"
+          fi
+
+          PAYLOAD=$(python3 -c "
           import json
-          with open("/dev/stdin") as f:
-            pass
+          payload = {
+            'assignees': ['copilot-swe-agent[bot]'],
+            'agent_assignment': {
+              'target_repo': '${{ github.repository }}',
+              'base_branch': '$BASE_BRANCH',
+              'custom_instructions': '',
+              'custom_agent': ''
+            }
+          }
+          print(json.dumps(payload))
+          ")
 
-          import subprocess
-          result = subprocess.run(
-            ["cat", "/dev/stdin"],
-            input='${{ toJSON(steps.assign) }}',
-            capture_output=True, text=True
-          )
-          PYEOF
+          echo "Sending agent_assignment payload to REST API..."
+          echo "  endpoint: POST /repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/assignees"
+          echo "  assignee: copilot-swe-agent[bot]"
+          echo "  target_repo: ${{ github.repository }}"
+          echo "  base_branch: $BASE_BRANCH"
 
-          # Simple REST check
-          ASSIGNEES=$(echo "$RESPONSE" | python3 -c "
+          HTTP=$(curl -s -o /tmp/assign_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/assignees")
+
+          echo "HTTP response: $HTTP"
+
+          if [ "$HTTP" = "201" ]; then
+            ASSIGNEES=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/assign_response.json'))
+          names = [a['login'] for a in d.get('assignees', [])]
+          print(', '.join(names) if names else 'none')
+            ")
+            echo "✅ Assignment succeeded!"
+            echo "   Assignees: $ASSIGNEES"
+          else
+            echo "❌ Assignment failed (HTTP $HTTP)"
+            echo "--- Response body ---"
+            cat /tmp/assign_response.json
+            echo ""
+            echo "--- Troubleshooting guide ---"
+            echo "HTTP 403 / 'Resource not accessible by personal access token':"
+            echo "  → Your COPILOT_ASSIGN_PAT is a fine-grained PAT with insufficient scope"
+            echo "  → Fix: create a CLASSIC PAT at https://github.com/settings/tokens"
+            echo "         Required scope: repo (full)"
+            echo "         Store as repo secret: COPILOT_ASSIGN_PAT"
+            echo ""
+            echo "HTTP 422 / 'invalid assignees':"
+            echo "  → Copilot cloud agent is not enabled on this repo or account"
+            echo "  → Fix: go to Settings > Copilot > Coding agent and enable it"
+            echo ""
+            echo "HTTP 401:"
+            echo "  → PAT is expired or revoked — regenerate it"
+            exit 1
+          fi
+
+      # ── 6. Verify assignment + check for Copilot PR ─────────────────────────
+      - name: Verify assignment and check for Copilot PR
+        env:
+          PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          sleep 5  # brief pause for assignment to propagate
+
+          # Check issue assignees
+          ISSUE=$(curl -s \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ inputs.issue_number }}")
+
+          ASSIGNEES=$(python3 -c "
+          import json, sys
+          d = json.loads('''$ISSUE'''.replace(\"'''\", ''))
+          " 2>/dev/null || echo "parse error")
+
+          ASSIGNEES=$(echo "$ISSUE" | python3 -c "
           import sys, json
           d = json.loads(sys.stdin.read())
-          assignees = [a['login'] for a in d.get('assignees', [])]
-          print(', '.join(assignees) if assignees else 'none')
+          names = [a['login'] for a in d.get('assignees', [])]
+          print(', '.join(names) if names else 'none')
           ")
-          echo "✅ Current assignees on issue #${{ inputs.issue_number }}: $ASSIGNEES"
+          echo "✅ Issue #${{ inputs.issue_number }} current assignees: $ASSIGNEES"
 
-      # ── 10. Check for existing PRs from Copilot ──────────────────────────────
-      - name: Check for Copilot PRs
-        run: |
+          # Check for any open PRs from Copilot
           PRS=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}" \
+            -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ steps.resolve.outputs.target_repo }}/pulls?state=open&per_page=20")
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&per_page=20")
 
-          python3 << 'PYEOF'
-          import sys, json, subprocess
-
-          result = subprocess.run(
-            ["curl", "-s",
-             "-H", "Authorization: Bearer ${{ secrets.COPILOT_ASSIGN_PAT }}",
-             "-H", "Accept: application/vnd.github+json",
-             "-H", "X-GitHub-Api-Version: 2022-11-28",
-             "https://api.github.com/repos/${{ steps.resolve.outputs.target_repo }}/pulls?state=open&per_page=20"
-            ],
-            capture_output=True, text=True
-          )
-
-          prs = json.loads(result.stdout)
-          copilot_prs = [pr for pr in prs if "copilot" in pr.get("user", {}).get("login", "").lower()]
-
-          if copilot_prs:
-            print("✅ Copilot PRs already open:")
-            for pr in copilot_prs:
-              print(f"   PR #{pr['number']}: {pr['title']}")
-              print(f"   URL: {pr['html_url']}")
+          COPILOT_PRS=$(echo "$PRS" | python3 -c "
+          import sys, json
+          prs = json.loads(sys.stdin.read())
+          found = [pr['html_url'] for pr in prs if 'copilot' in pr.get('user', {}).get('login', '').lower()]
+          if found:
+              print('Copilot PRs found:')
+              for url in found:
+                  print('  ' + url)
           else:
-            print("ℹ️  No Copilot PRs open yet.")
-            print("   Copilot typically takes 2–10 minutes to open a PR after assignment.")
-            print("   Check the issue page: https://github.com/${{ steps.resolve.outputs.target_repo }}/issues/${{ inputs.issue_number }}")
-          PYEOF
-
-      # ── 11. Final summary ────────────────────────────────────────────────────
-      - name: Summary
-        run: |
-          echo "═══════════════════════════════════════════════════════"
-          echo "  Launch Copilot Agent — Workflow Summary"
-          echo "═══════════════════════════════════════════════════════"
-          echo "  Repo         : ${{ steps.resolve.outputs.target_repo }}"
-          echo "  Issue        : #${{ inputs.issue_number }}"
-          echo "  Base branch  : ${{ inputs.base_branch }}"
-          echo "  Status       : Assignment attempted ✅"
-          echo ""
-          echo "  Next steps:"
-          echo "  1. Open issue: https://github.com/${{ steps.resolve.outputs.target_repo }}/issues/${{ inputs.issue_number }}"
-          echo "  2. Verify Copilot appears in Assignees sidebar"
-          echo "  3. Copilot will open a PR in 2–10 minutes"
-          echo "  4. PR will appear at: https://github.com/${{ steps.resolve.outputs.target_repo }}/pulls"
-          echo "═══════════════════════════════════════════════════════"
-          echo ""
-          echo "SAFETY REMINDER:"
-          echo "  ✅ No code was merged"
-          echo "  ✅ No deployments were made"
-          echo "  ✅ No secrets were printed"
-          echo "  ✅ No repository settings were changed"
+              print('No Copilot PRs yet (Copilot may still be starting — check GitHub in 5-10 min)')
+          ")
+          echo "$COPILOT_PRS"
